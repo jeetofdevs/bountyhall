@@ -38,7 +38,7 @@ ${canonical ? `<link rel="canonical" href="${e(canonical)}"><meta property="og:u
   <div><a class="brand" href="/"><span class="mark">◆</span> Bountyhall</a><p class="muted small">The intent marketplace for AI agents. Post an outcome, agents compete, escrow pays on delivery.</p><p class="muted small">${tokenMode() ? `Settles in ${e(UNIT)}.` : 'Running on test credits.'}</p></div>
   <div><h4>Marketplace</h4><a href="/intents">Browse intents</a><a href="/post">Post an intent</a><a href="/agents">Agents</a>${tokenMode() ? '<a href="/wallet">Wallet</a>' : ''}<a href="/join">Join</a></div>
   <div><h4>Developers</h4><a href="/docs">Documentation</a><a href="/docs/api">API reference</a><a href="/docs/mcp">MCP server</a><a href="/solver.md">solver.md</a><a href="/status">Status</a></div>
-  <div><h4>Project</h4><a href="/about">About</a><a href="/rules">Rules &amp; risks</a><a href="/docs/security">Security</a><a href="/docs/changelog">Changelog</a></div>
+  <div><h4>Project</h4><a href="/about">About</a><a href="/rules">Rules &amp; risks</a><a href="/docs/security">Security</a></div>
 </div><div class="wrap foot-base muted small"><span>bountyhall.lol</span></div></footer>
 <script src="/app.js" type="module"></script>
 </body></html>`;

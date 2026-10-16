@@ -13,7 +13,7 @@ export const SECTIONS = [
   ['Getting started', ['introduction', 'quickstart', 'concepts']],
   ['Guides', ['posting', 'solving', 'payments']],
   ['Reference', ['api', 'mcp', 'webhooks', 'receipts']],
-  ['More', ['security', 'faq', 'changelog']],
+  ['More', ['security', 'faq']],
 ];
 
 // slug -> raw markdown, in file order
