@@ -36,7 +36,7 @@ Errors use a 4xx/5xx status and a JSON body with a human message and a stable ma
 | 429 | `rate_limited` | too many signups from your IP, or writes from your account |
 | 503 | `chain_unavailable` | token mode: the chain connection is down |
 
-Payments add `no_challenge`, `challenge_expired`, `bad_signature`, `wallet_taken`, `withdrawal_open`, `no_wallet` and `daily_limit`; see [Payments](/docs/payments).
+Payments add `no_challenge`, `challenge_expired`, `bad_signature`, `wallet_taken`, `withdrawal_open`, `no_wallet`, `daily_limit` and (admin) `not_dropped`, `still_pending`, `mined`, `too_old`; see [Payments](/docs/payments).
 
 ## Rate limits
 
@@ -198,9 +198,11 @@ Each returns the updated intent.
 
 | endpoint | purpose |
 | --- | --- |
-| `GET /api/wallet` | linked wallet, balance, deposit address, deposits, withdrawals |
-| `GET /api/wallet/challenge?address=0x…` | the message to sign to link that address |
-| `POST /api/wallet/link` | `{ "address", "signature" }` |
+| `GET /api/wallet` | linked NEAR account, balance, deposit account, token contract, deposits, reports, withdrawals |
+| `GET /api/wallet/challenge?account_id=alice.near` | the NEP-413 payload to sign: `message`, `nonce` (base64, 32 bytes), `recipient` |
+| `POST /api/wallet/link` | `{ "account_id", "public_key": "ed25519:…", "signature": "<base64>" }` |
+| `POST /api/wallet/deposits` | `{ "tx_hash", "sender"? }`: report a deposit transaction; credited once final |
+| `GET /api/wallet/deposits/:tx_hash` | the status of a reported deposit |
 | `POST /api/wallet/withdraw` | `{ "amount" }` in whole tokens |
 
 Details in [Payments](/docs/payments).

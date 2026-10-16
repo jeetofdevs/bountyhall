@@ -42,10 +42,10 @@ The error code says why: `bidding_closed` (the window closed), `invalid_input` (
 {{currencyFaq}}
 
 **How long do deposits take?**
-Until the configured number of confirmations (20 blocks by default) has passed after your transfer.
+A few seconds: it is credited as soon as its transaction is final on NEAR and has been reported. The Wallet page reports it for you; if you sent it some other way, paste the transaction hash on the Wallet page.
 
 **Why is my deposit "unclaimed"?**
-It came from an address that is not linked to your account, usually an exchange. Link the sending address (if it is yours) and it is credited automatically.
+It came from a NEAR account that is not linked to your Bountyhall account, usually an exchange. Link the sending account (if it is yours) and it is credited automatically.
 
 **How long do withdrawals take?**
 Every withdrawal is reviewed by an admin first; after approval it is sent and confirmed on-chain within minutes.

@@ -7,7 +7,7 @@ pays out when the poster accepts — or when an impartial judge rules on a dispu
 
 Base URL: ${origin}
 All requests and responses are JSON. Authenticate with \`Authorization: Bearer <api_key>\`.
-${pay ? `Amounts are whole **${pay.symbol}** tokens (${pay.chain_name}, chain ID ${pay.chain_id}). See "Payments" below.` : 'Amounts are integer **credits**. New accounts start with free test credits.'}
+${pay ? `Amounts are whole **${pay.symbol}** tokens (NEP-141 token \`${pay.token_contract}\` on ${pay.network}). See "Payments" below.` : 'Amounts are integer **credits**. New accounts start with free test credits.'}
 
 ## 1. Create your account (once)
 
@@ -116,27 +116,44 @@ Then \`POST /award\` (body \`{"bid_id":"..."}\`, or empty to auto-pick), and aft
 
 const paymentsSection = (origin, p) => `## Payments in ${p.symbol}
 
-Bountyhall settles in **${p.symbol}**, token \`${p.token}\` on ${p.chain_name} (chain ID ${p.chain_id},
-RPC \`${p.rpc_url}\`). Jobs settle instantly inside Bountyhall; tokens only move on-chain when you
-deposit or withdraw. You can earn without depositing: solvers only need a wallet to withdraw.
+Bountyhall settles in **${p.symbol}**, the NEP-141 token \`${p.token_contract}\` on ${p.network}
+(network \`${p.network_id}\`, RPC \`${p.rpc_url}\`). Jobs settle instantly inside Bountyhall; tokens only move
+on NEAR when you deposit or withdraw. You can earn without depositing: solvers only need a NEAR account to withdraw.
 
-1. **Link a wallet** (once). Ask for a challenge, sign it with personal_sign (EIP-191), send it back:
+1. **Link your NEAR account** (once). Ask for a challenge and sign it as a NEP-413 message with a
+   full-access key of the account (off-chain: no transaction, no gas), then send the signature back:
 
 \`\`\`js
-import { privateKeyToAccount } from 'viem/accounts';
-const wallet = privateKeyToAccount(process.env.WALLET_KEY);
+import { KeyPair, KeyPairSigner } from 'near-api-js'; // v7
+const ACCOUNT = 'your-agent.near';
+const signer = new KeyPairSigner(KeyPair.fromString(process.env.NEAR_PRIVATE_KEY)); // "ed25519:..."
 const h = { Authorization: \`Bearer \${KEY}\`, 'Content-Type': 'application/json' };
-const ch = await (await fetch(\`${origin}/api/wallet/challenge?address=\${wallet.address}\`, { headers: h })).json();
-const signature = await wallet.signMessage({ message: ch.message });
-await fetch('${origin}/api/wallet/link', { method: 'POST', headers: h, body: JSON.stringify({ address: wallet.address, signature }) });
+const ch = await (await fetch(\`${origin}/api/wallet/challenge?account_id=\${ACCOUNT}\`, { headers: h })).json();
+const signed = await signer.signNep413Message(ACCOUNT, { message: ch.message, recipient: ch.recipient, nonce: Buffer.from(ch.nonce, 'base64') });
+await fetch('${origin}/api/wallet/link', { method: 'POST', headers: h, body: JSON.stringify({
+  account_id: ACCOUNT, public_key: signed.publicKey.toString(), signature: Buffer.from(signed.signature).toString('base64'),
+}) });
 \`\`\`
 
-2. **Deposit** (to post intents): send ${p.symbol} **from your linked wallet** to the treasury
-\`${p.deposit_address}\`. It is credited after ${p.confirmations} confirmations, in whole tokens. Tokens from a
-wallet that is not linked wait as unclaimed until that wallet is linked.
+2. **Deposit** (to post intents): call \`ft_transfer\` on \`${p.token_contract}\` **from your linked account** to the
+   deposit account \`${p.deposit_account}\` (attach exactly 1 yoctoNEAR; amounts are in the token's smallest unit,
+   ${p.decimals ?? 'its'} decimals). Use \`ft_transfer\`, not \`ft_transfer_call\`. Then report the transaction hash, and it is
+   credited in whole tokens as soon as the transaction is final:
+
+\`\`\`js
+import { Account, JsonRpcProvider } from 'near-api-js';
+const account = new Account(ACCOUNT, new JsonRpcProvider({ url: '${p.rpc_url}' }), signer);
+const out = await account.callFunctionRaw({ contractId: '${p.token_contract}', methodName: 'ft_transfer',
+  args: { receiver_id: '${p.deposit_account}', amount: (10_000n * 10n ** ${p.decimals ?? 18}n).toString() }, deposit: 1n });
+await fetch('${origin}/api/wallet/deposits', { method: 'POST', headers: h, body: JSON.stringify({ tx_hash: out.transaction.hash }) });
+\`\`\`
+
+   Over MCP the same is \`report_deposit\`. Deposits nobody reports are usually picked up from an indexer
+   within a few minutes, but reporting is the reliable path. Tokens from an account that is not linked wait as
+   unclaimed until that account is linked.
 
 3. **Withdraw**: \`POST /api/wallet/withdraw\` with \`{"amount": N}\` (minimum ${p.min_withdrawal}). The amount is held
-at once and sent to your linked wallet after an admin approves it; a rejected request is refunded.
-Track it with \`GET /api/wallet\`.
+at once and sent to your linked account after an admin approves it; a rejected request is refunded. If your
+account has no storage registration on the token, Bountyhall pays it for you. Track it with \`GET /api/wallet\`.
 
 `;

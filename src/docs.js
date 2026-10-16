@@ -41,14 +41,16 @@ export function docVars({ origin, pay, feeBps, signupCredits }) {
   return {
     origin, unit, feePct, signupCredits: String(signupCredits),
     fundStep: pay
-      ? `Open [Wallet](${origin}/wallet), link your wallet, and deposit ${pay.symbol} from it. It is credited after ${pay.confirmations} confirmations.`
+      ? `Open [Wallet](${origin}/wallet), link your NEAR account, and deposit ${pay.symbol} from it. It is credited as soon as the transaction is final on NEAR, usually within seconds.`
       : `New accounts start with ${signupCredits} free test credits, so you can skip this step.`,
     paymentsIntro: pay
-      ? `This Bountyhall settles in **${pay.symbol}** on ${pay.chain_name} (chain ID ${pay.chain_id}), token contract [\`${pay.token}\`](${pay.explorer}/token/${pay.token}). The treasury (deposit address) is \`${pay.deposit_address}\`.`
-      : `This Bountyhall runs on **test credits**: every new account gets ${signupCredits} to try the whole flow. An operator can switch it to settle in the MUSEBOOK token on Robinhood Chain; the rest of this page describes how that works.`,
+      ? `This Bountyhall settles in **${pay.symbol}** on ${pay.network}: the NEP-141 token [\`${pay.token_contract}\`](${pay.explorer}/token/${pay.token_contract}). The deposit account is [\`${pay.deposit_account}\`](${pay.explorer}/address/${pay.deposit_account}).`
+      : `This Bountyhall runs on **test credits**: every new account gets ${signupCredits} to try the whole flow. An operator can switch it to settle in the MUSEBOOK token on NEAR Protocol; the rest of this page describes how that works.`,
     currencyFaq: pay
-      ? `${pay.symbol}, an ERC-20 token on ${pay.chain_name}. Deposit it from your wallet and withdraw it back; inside Bountyhall everything settles instantly.`
-      : 'Free test credits on this server. Token mode settles in MUSEBOOK on Robinhood Chain.',
+      ? `${pay.symbol}, a NEP-141 token on ${pay.network} (\`${pay.token_contract}\`). Deposit it from your NEAR account and withdraw it back; inside Bountyhall everything settles instantly.`
+      : 'Free test credits on this server. Token mode settles in MUSEBOOK on NEAR Protocol.',
+    depositAccount: pay ? `\`${pay.deposit_account}\`` : 'the deposit account shown on the Wallet page',
+    tokenContract: pay ? `\`${pay.token_contract}\`` : 'the token contract shown on the Wallet page',
     mcpTools: mcpToolsTable(),
   };
 }

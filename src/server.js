@@ -13,7 +13,7 @@ import { solverDoc } from './solver-doc.js';
 import * as docs from './docs.js';
 import { handleRpc } from './mcp.js';
 import { createDispatcher, validateWebhookUrl } from './webhooks.js';
-import { Payments, paymentsConfigFromEnv } from './payments.js';
+import { Payments, paymentsConfigFromEnv, brokenChain } from './payments.js';
 import { createChain } from './chain.js';
 import { HouseAgent } from './house-agent.js';
 import { claudeEnabled, MODEL } from './claude.js';
@@ -27,6 +27,9 @@ const STATIC = {
   '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
   '/favicon.svg': ['public/favicon.svg', 'image/svg+xml'],
   '/solver.js': ['scripts/solver.js', 'text/javascript; charset=utf-8'],
+  // NEAR wallet selector, prebuilt by `npm run build:wallet`; loaded only when a user connects a wallet
+  '/vendor/near-wallet.js': ['public/vendor/near-wallet.js', 'text/javascript; charset=utf-8'],
+  '/vendor/near-wallet.css': ['public/vendor/near-wallet.css', 'text/css; charset=utf-8'],
 };
 const MAX_BODY = 64 * 1024;
 
@@ -50,7 +53,12 @@ export function createApp({ dbFile, market: marketOpts = {}, sweepMs = 15000, ju
   const tokenMode = payCfg.mode === 'token';
   // in token mode every credit must be backed by a deposit, so there is no signup faucet
   const market = new Market(db, tokenMode ? { ...marketOpts, signupCredits: 0 } : marketOpts);
-  const payments = tokenMode ? new Payments(market, payOpts.chain ?? createChain(payCfg), payCfg) : null;
+  let chain = payOpts.chain ?? null;
+  if (tokenMode && !chain) {
+    // an incomplete configuration keeps the site up and shows what is missing
+    try { chain = createChain({ ...payCfg, fetch: payOpts.fetch }); } catch (err) { chain = brokenChain(payCfg, err); }
+  }
+  const payments = tokenMode ? new Payments(market, chain, payCfg) : null;
   views.setUnit(tokenMode ? payCfg.symbol : 'cr');
   views.setOrigin(process.env.PUBLIC_URL || '');
   const pollMs = payOpts.pollMs ?? Number(process.env.CHAIN_POLL_MS ?? 15000);
@@ -113,13 +121,16 @@ export function createApp({ dbFile, market: marketOpts = {}, sweepMs = 15000, ju
     ];
     if (payments) {
       const t = await payments.treasury().catch((e) => ({ last_error: e.message }));
-      const gas = t.gas_balance_wei ? BigInt(t.gas_balance_wei) : null;
+      const near = t.near_balance != null ? Number(t.near_balance) : null;
+      const freeRpc = /free\.rpc\.fastnear|rpc\.(mainnet|testnet)\.near\.org|rpc\.testnet\.fastnear/.test(payCfg.rpcUrl);
       checks.push(
-        check('Chain connection', payments.ready && !payments.lastError, payments.ready ? `${payCfg.chainName} (${payCfg.chainId}), scanned to block ${t.cursor_block ?? '—'}${payments.lastError ? `; last error: ${payments.lastError}` : ''}` : `not connected: ${payments.lastError || 'checking'}`),
-        check('Hot wallet key', payments.chain.canSend, payments.chain.canSend ? `treasury ${payments.chain.treasury}` : 'HOT_WALLET_PRIVATE_KEY is not set: deposits work, withdrawals cannot be sent'),
-        check('Gas for withdrawals', gas != null && gas >= 10n ** 15n, gas == null ? 'unknown' : `${Number(gas / 10n ** 12n) / 1e6} ETH`, 'warn'),
+        check('NEAR connection', payments.ready && !payments.lastError, payments.ready ? `${payCfg.networkName} (${payCfg.networkId}), token ${payments.chain.token}${payments.lastError ? `; last error: ${payments.lastError}` : ''}` : `not connected: ${payments.lastError || 'checking'}`),
+        check('Treasury storage', payments.treasuryRegistered, payments.treasuryRegistered == null ? 'unknown' : payments.treasuryRegistered ? `${payments.chain.treasury} is registered on ${payments.chain.token}` : `${payments.chain.treasury} has no storage registration on ${payments.chain.token}: call storage_deposit, or deposits will fail`),
+        check('Hot wallet key', payments.chain.canSend, payments.chain.canSend ? `full-access key of ${payments.chain.treasury}` : 'HOT_WALLET_PRIVATE_KEY is not set: deposits work, withdrawals cannot be sent'),
+        check('NEAR for gas', near != null && near >= 0.5, near == null ? 'unknown' : `${t.near_balance} NEAR (pays gas and 0.00125 NEAR storage for each new receiver)`, 'warn'),
         check('Solvency', t.solvent, t.solvent == null ? 'unknown' : `${t.onchain_balance} on-chain vs ${t.owed_total} owed`),
-        check('RPC endpoint', !payCfg.rpcUrl.includes('rpc.mainnet.chain.robinhood.com'), payCfg.rpcUrl.includes('rpc.mainnet.chain.robinhood.com') ? 'public, rate-limited RPC: use a provider for production' : 'custom provider', 'warn'),
+        check('Deposit indexer', !String(t.indexer).startsWith('error'), t.indexer === 'off' ? 'off: deposits are found only when reported by transaction hash' : t.indexer === 'ok' ? `${payCfg.indexerUrl} (a hint source; every deposit is verified on-chain)` : `${t.indexer}; reported deposits still work`, 'warn'),
+        check('RPC endpoint', !freeRpc, freeRpc ? 'free public RPC, rate-limited: set NEAR_RPC_URL to a provider for production' : 'custom provider', 'warn'),
       );
     } else {
       checks.push(check('Payments', true, 'test credits (set PAYMENTS=token to settle in MUSEBOOK)'));
@@ -134,7 +145,7 @@ export function createApp({ dbFile, market: marketOpts = {}, sweepMs = 15000, ju
     const up = Math.round((Date.now() - STARTED) / 1000);
     const uptime = up > 86400 ? `${Math.floor(up / 86400)}d ${Math.floor((up % 86400) / 3600)}h` : up > 3600 ? `${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m` : `${Math.floor(up / 60)}m`;
     const pc = payments?.publicConfig();
-    const p = pc ? { symbol: pc.symbol, chain_name: pc.chain_name, ready: pc.ready && !payments.lastError, block: db.prepare("SELECT v FROM meta WHERE k = 'chain_cursor'").get()?.v ?? null } : null;
+    const p = pc ? { symbol: pc.symbol, network: pc.network, token_contract: pc.token_contract, ready: pc.ready && !payments.lastError } : null;
     return { ok: !p || p.ready, version: VERSION, uptime, uptime_s: up, judge: judgeEnabled() ? 'claude' : 'admin', house_agent: house ? house.me.name : null, payments: p };
   }
 
@@ -187,9 +198,11 @@ export function createApp({ dbFile, market: marketOpts = {}, sweepMs = 15000, ju
     ['GET', /^\/api\/payments$/, () => (payments ? payments.publicConfig() : { mode: 'credits', symbol: 'cr' })],
     ['GET', /^\/api\/wallet$/, ({ me }) => {
       const p = pay(); need(me);
-      return { wallet: p.wallet(me.id), balance: market.balance(me.id), deposit_address: p.chain.treasury, deposits: p.deposits(me.id), withdrawals: p.withdrawals({ accountId: me.id }) };
+      return { wallet: p.wallet(me.id), balance: market.balance(me.id), deposit_account: p.chain.treasury, token_contract: p.chain.token, deposits: p.deposits(me.id), reports: p.depositReports(me.id), withdrawals: p.withdrawals({ accountId: me.id }) };
     }],
-    ['GET', /^\/api\/wallet\/challenge$/, ({ me, query }) => pay().challenge(need(me), query.get('address'))],
+    ['GET', /^\/api\/wallet\/challenge$/, ({ me, query }) => pay().challenge(need(me), query.get('account_id'))],
+    ['POST', /^\/api\/wallet\/deposits$/, async ({ me, body }) => [202, await pay().reportDeposit(need(me), body)]],
+    ['GET', /^\/api\/wallet\/deposits\/([^/]+)$/, ({ me, params }) => { need(me); return pay().depositReport(params[0]); }],
     ['POST', /^\/api\/wallet\/link$/, ({ me, body }) => pay().link(need(me), body)],
     ['POST', /^\/api\/wallet\/withdraw$/, ({ me, body }) => [201, pay().requestWithdrawal(need(me), body)]],
     ['POST', /^\/api\/admin\/resolve\/([^/]+)$/, ({ req, params, body }) => {
@@ -337,10 +350,11 @@ export function createApp({ dbFile, market: marketOpts = {}, sweepMs = 15000, ju
     const hooks = { onReject: startJudge, payments };
     try {
       if (Array.isArray(body)) {
-        const out = body.map((m) => handleRpc(market, me, m, hooks)).filter(Boolean);
+        const out = [];
+        for (const m of body) { const r = await handleRpc(market, me, m, hooks); if (r) out.push(r); }
         return out.length ? json(res, 200, out) : send(res, 202, '');
       }
-      const out = handleRpc(market, me, body, hooks);
+      const out = await handleRpc(market, me, body, hooks);
       return out ? json(res, 200, out) : send(res, 202, '');
     } catch (err) {
       console.error(err);

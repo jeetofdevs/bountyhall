@@ -187,20 +187,40 @@ function liveFeed() {
 })();
 
 // ---------- wallet (token mode) ----------
-const shortAddr = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
-const toHex = (text) => '0x' + [...new TextEncoder().encode(text)].map((b) => b.toString(16).padStart(2, '0')).join('');
-function eth() {
-  if (!window.ethereum) throw new Error('No browser wallet found. Install MetaMask (or another EVM wallet), or link your wallet through the API.');
-  return window.ethereum;
+const shortAcct = (a) => (a && a.length > 24 ? `${a.slice(0, 10)}…${a.slice(-6)}` : a || '');
+const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+// The NEAR wallet selector is a large bundle, so it loads only when needed.
+let nearReady = null;
+function loadNear() {
+  nearReady ??= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = '/vendor/near-wallet.js';
+    s.onload = () => (window.BountyhallNear ? resolve(window.BountyhallNear) : reject(new Error('the NEAR wallet library did not load')));
+    s.onerror = () => { nearReady = null; reject(new Error('could not load the NEAR wallet library')); };
+    document.head.append(s);
+  });
+  return nearReady;
 }
-async function ensureChain(cfg) {
-  const chainId = '0x' + Number(cfg.chain_id).toString(16);
-  try {
-    await eth().request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] });
-  } catch (err) {
-    if (err.code !== 4902) throw err;
-    await eth().request({ method: 'wallet_addEthereumChain', params: [{ chainId, chainName: cfg.chain_name, nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: [cfg.rpc_url], blockExplorerUrls: [cfg.explorer] }] });
+// Returns the connected wallet and its account id, asking the user to pick a wallet if needed.
+async function nearWallet(cfg) {
+  const near = await loadNear();
+  const { selector, modal } = await near.connect({ network: cfg.network_id, contractId: cfg.token_contract });
+  if (!selector.isSignedIn()) {
+    await new Promise((resolve, reject) => {
+      const sub = selector.on('signedIn', () => { sub.remove(); resolve(); });
+      modal.on?.('onHide', ({ hideReason }) => { if (hideReason === 'user-triggered') { sub.remove(); reject(new Error('no wallet selected')); } });
+      modal.show();
+    });
   }
+  const wallet = await selector.wallet();
+  const [account] = await wallet.getAccounts();
+  if (!account) throw new Error('the wallet returned no account');
+  return { wallet, accountId: account.accountId };
+}
+async function reportDeposit(hash) {
+  const r = await api('POST', '/api/wallet/deposits', { tx_hash: hash });
+  return r.status === 'done' ? 'credited' : r.status === 'pending' ? 'reported; it is credited once final (seconds)' : `${r.status}${r.error ? `: ${r.error}` : ''}`;
 }
 
 async function renderWallet() {
@@ -208,41 +228,50 @@ async function renderWallet() {
   if (!box) return;
   const cfg = JSON.parse(box.dataset.config);
   if (!store.get()) { box.innerHTML = '<p><a href="/join">Join</a> or add your API key to use your wallet.</p>'; return; }
+  // wallets that redirect back (instead of a popup) put the hashes in the URL
+  const back = new URLSearchParams(location.search).get('transactionHashes');
+  if (back) {
+    for (const h of back.split(',')) await reportDeposit(h).catch(() => {});
+    history.replaceState(null, '', location.pathname);
+  }
   const w = await api('GET', '/api/wallet');
-  const tx = (h) => (h ? `<a href="${esc(cfg.explorer)}/tx/${esc(h)}">${esc(h.slice(0, 10))}…</a>` : '—');
+  const tx = (h) => (h ? `<a href="${esc(cfg.explorer)}/txns/${esc(h)}">${esc(h.slice(0, 10))}…</a>` : '—');
+  const acct = (id) => `<a href="${esc(cfg.explorer)}/address/${esc(id)}"><code>${esc(shortAcct(id))}</code></a>`;
   const when = (t) => new Date(t).toLocaleString();
   const linked = w.wallet
-    ? `<p>Linked wallet: <a href="${esc(cfg.explorer)}/address/${esc(w.wallet.address)}"><code>${esc(w.wallet.address)}</code></a> <button class="btn small ghost" id="link-wallet">Change</button></p>`
-    : `<p>No wallet linked yet. Link one to deposit and withdraw ${esc(cfg.symbol)}.</p><button class="btn" id="link-wallet">Connect wallet and sign</button>`;
+    ? `<p>Linked NEAR account: ${acct(w.wallet.account_id)} <button class="btn small ghost" id="link-wallet">Change</button></p>`
+    : `<p>No NEAR account linked yet. Link one to deposit and withdraw ${esc(cfg.symbol)}.</p><button class="btn" id="link-wallet">Connect NEAR wallet and sign</button>`;
   box.innerHTML = `
   <section class="stats"><div><b>${w.balance.toLocaleString('en-US')}</b><span>${esc(cfg.symbol)} balance</span></div></section>
-  <section class="panel stack"><h2>1. Link your wallet</h2>${linked}<p class="err" id="link-err"></p>
-    <p class="small muted">You sign a one-time message; no transaction and no gas. Agents: see <a href="/solver.md">solver.md</a> to link from code.</p></section>
+  <section class="panel stack"><h2>1. Link your NEAR account</h2>${linked}<p class="err" id="link-err"></p>
+    <p class="small muted">Your wallet signs a one-time message (NEP-413): no transaction and no gas. Meteor, MyNearWallet and Intear Wallet work. Agents: see <a href="/solver.md">solver.md</a> to link from code.</p></section>
   <section class="panel stack"><h2>2. Deposit</h2>
     ${w.wallet ? `<div class="row gap wrap-row"><label>Amount (${esc(cfg.symbol)})<input id="dep-amount" type="number" min="1" step="1" placeholder="10000"></label><button class="btn" id="deposit" ${cfg.decimals == null ? 'disabled' : ''}>Send from my wallet</button></div>
-    <p class="small muted">Or send ${esc(cfg.symbol)} yourself <b>from your linked wallet</b> to <code>${esc(w.deposit_address)}</code> on ${esc(cfg.chain_name)}. It is credited after ${esc(cfg.confirmations)} confirmations.</p>` : '<p class="muted">Link a wallet first, so we know the deposit is yours.</p>'}
-    <p class="err" id="dep-err"></p><p id="dep-ok" class="small"></p></section>
+    <p class="small muted">Or send it yourself: <code>ft_transfer</code> on <code>${esc(w.token_contract)}</code> <b>from your linked account</b> to <code>${esc(w.deposit_account)}</code>, then paste the transaction hash below. It is credited once the transaction is final on NEAR.</p>
+    <div class="row gap wrap-row"><label>Transaction hash<input id="dep-hash" placeholder="e.g. 6zgh2u9Dq…" autocomplete="off"></label><button class="btn ghost" id="dep-report">Report deposit</button></div>` : '<p class="muted">Link a NEAR account first, so we know the deposit is yours.</p>'}
+    <p class="err" id="dep-err"></p><p id="dep-ok" class="small"></p>
+    ${w.reports?.length ? `<p class="small muted">Waiting: ${w.reports.map((r) => `${tx(r.tx_hash)} ${esc(r.status)}${r.error ? ` (${esc(r.error)})` : ''}`).join(' · ')}</p>` : ''}</section>
   <section class="panel"><h2>3. Withdraw</h2>
     ${w.wallet ? `<form data-form class="stack"><input type="hidden" name="_action" value="withdraw">
       <div class="row gap wrap-row"><label>Amount (${esc(cfg.symbol)}, minimum ${esc(cfg.min_withdrawal)})<input name="amount" type="number" min="${esc(cfg.min_withdrawal)}" step="1" required></label><button class="btn" type="submit">Request withdrawal</button></div>
-      <p class="small muted">Goes to ${esc(shortAddr(w.wallet.address))} after an admin reviews it. The amount leaves your balance now and comes back if the request is rejected.</p><p class="err" data-err></p></form>` : '<p class="muted">Link a wallet first.</p>'}</section>
+      <p class="small muted">Goes to ${esc(shortAcct(w.wallet.account_id))} after an admin reviews it. The amount leaves your balance now and comes back if the request is rejected.</p><p class="err" data-err></p></form>` : '<p class="muted">Link a NEAR account first.</p>'}</section>
   <h2>Deposits</h2>
   <div class="table-wrap"><table><thead><tr><th>When</th><th>Amount</th><th>Status</th><th>Transaction</th></tr></thead><tbody>
   ${w.deposits.map((d) => `<tr><td>${when(d.created_at)}</td><td>${cr(d.credited)}</td><td>${esc(d.status)}</td><td>${tx(d.tx_hash)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">None yet.</td></tr>'}
   </tbody></table></div>
   <h2>Withdrawals</h2>
   <div class="table-wrap"><table><thead><tr><th>When</th><th>Amount</th><th>To</th><th>Status</th><th>Transaction</th></tr></thead><tbody>
-  ${w.withdrawals.map((x) => `<tr><td>${when(x.created_at)}</td><td>${cr(x.amount)}</td><td><code>${esc(shortAddr(x.to_address))}</code></td><td>${esc(x.status)}${x.note ? `<div class="small muted">${esc(x.note)}</div>` : ''}</td><td>${tx(x.tx_hash)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">None yet.</td></tr>'}
+  ${w.withdrawals.map((x) => `<tr><td>${when(x.created_at)}</td><td>${cr(x.amount)}</td><td><code>${esc(shortAcct(x.to_account))}</code></td><td>${esc(x.status)}${x.note ? `<div class="small muted">${esc(x.note)}</div>` : ''}</td><td>${tx(x.tx_hash)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">None yet.</td></tr>'}
   </tbody></table></div>`;
 
   $('#link-wallet').onclick = async () => {
     const err = $('#link-err'); err.textContent = '';
     try {
-      const [address] = await eth().request({ method: 'eth_requestAccounts' });
-      await ensureChain(cfg);
-      const ch = await api('GET', `/api/wallet/challenge?address=${encodeURIComponent(address)}`);
-      const signature = await eth().request({ method: 'personal_sign', params: [toHex(ch.message), address] });
-      await api('POST', '/api/wallet/link', { address, signature });
+      const { wallet, accountId } = await nearWallet(cfg);
+      const ch = await api('GET', `/api/wallet/challenge?account_id=${encodeURIComponent(accountId)}`);
+      const signed = await wallet.signMessage({ message: ch.message, recipient: ch.recipient, nonce: fromB64(ch.nonce) });
+      if (!signed) throw new Error('the wallet did not return a signature');
+      await api('POST', '/api/wallet/link', { account_id: signed.accountId || accountId, public_key: signed.publicKey, signature: signed.signature });
       location.reload();
     } catch (e) { err.textContent = e.message; }
   };
@@ -252,13 +281,27 @@ async function renderWallet() {
     try {
       const amount = Number($('#dep-amount').value);
       if (!Number.isInteger(amount) || amount < 1) throw new Error('enter a whole number of tokens');
-      const [from] = await eth().request({ method: 'eth_requestAccounts' });
-      if (from.toLowerCase() !== w.wallet.address.toLowerCase()) throw new Error(`switch your wallet to the linked address ${shortAddr(w.wallet.address)}`);
-      await ensureChain(cfg);
+      const { wallet, accountId } = await nearWallet(cfg);
+      if (accountId !== w.wallet.account_id) throw new Error(`switch your wallet to the linked account ${shortAcct(w.wallet.account_id)}`);
       const raw = BigInt(amount) * 10n ** BigInt(cfg.decimals);
-      const data = '0xa9059cbb' + w.deposit_address.slice(2).toLowerCase().padStart(64, '0') + raw.toString(16).padStart(64, '0');
-      const hash = await eth().request({ method: 'eth_sendTransaction', params: [{ from, to: cfg.token, data }] });
-      $('#dep-ok').innerHTML = `Sent: ${tx(hash)}. It shows up here after ${esc(cfg.confirmations)} confirmations.`;
+      const out = await wallet.signAndSendTransaction({
+        receiverId: cfg.token_contract,
+        actions: [{ type: 'FunctionCall', params: { methodName: 'ft_transfer', args: { receiver_id: w.deposit_account, amount: raw.toString() }, gas: '30000000000000', deposit: '1' } }],
+      });
+      const hash = out?.transaction?.hash || out?.transaction_outcome?.id;
+      if (!hash) { $('#dep-ok').textContent = 'Sent. Paste the transaction hash above if it does not show up in a minute.'; return; }
+      $('#dep-ok').innerHTML = `Sent: ${tx(hash)} · ${esc(await reportDeposit(hash))}`;
+      setTimeout(() => location.reload(), 4000);
+    } catch (e) { err.textContent = e.message; }
+  };
+  const rep = $('#dep-report');
+  if (rep) rep.onclick = async () => {
+    const err = $('#dep-err'); err.textContent = ''; $('#dep-ok').textContent = '';
+    try {
+      const hash = $('#dep-hash').value.trim();
+      if (!hash) throw new Error('paste the transaction hash first');
+      $('#dep-ok').innerHTML = `${tx(hash)} · ${esc(await reportDeposit(hash))}`;
+      setTimeout(() => location.reload(), 4000);
     } catch (e) { err.textContent = e.message; }
   };
 }
@@ -311,7 +354,7 @@ async function renderAdmin() {
   if (treasury) {
     const t = treasury;
     parts.push(`<section class="panel"><h2>Treasury</h2>
-      <p>${t.solvent === undefined ? '<span class="err">Chain unreachable: ' + esc(t.last_error || '') + '</span>' : t.solvent ? '<b class="pos">Solvent</b>' : '<b class="neg">UNDER-COLLATERALISED</b>'} · address <code>${esc(t.address)}</code></p>
+      <p>${t.solvent === undefined ? '<span class="err">Chain unreachable: ' + esc(t.last_error || '') + '</span>' : t.solvent ? '<b class="pos">Solvent</b>' : '<b class="neg">UNDER-COLLATERALISED</b>'} · account <code>${esc(t.account)}</code> · token <code>${esc(t.token_contract)}</code></p>
       <section class="stats">
         <div><b>${t.onchain_balance?.toLocaleString('en-US') ?? '—'}</b><span>on-chain ${esc(t.symbol)}</span></div>
         <div><b>${t.owed_total.toLocaleString('en-US')}</b><span>owed in total</span></div>
@@ -320,17 +363,17 @@ async function renderAdmin() {
         <div><b>${t.pending_withdrawals.toLocaleString('en-US')}</b><span>pending withdrawals</span></div>
         <div><b>${t.fees.toLocaleString('en-US')}</b><span>house fees</span></div>
       </section>
-      <p class="small muted">Gas balance: ${t.gas_balance_wei ? (Number(BigInt(t.gas_balance_wei) / 10n ** 12n) / 1e6).toFixed(6) + ' ETH' : '—'} · unclaimed deposits: ${t.unclaimed_deposits} · unbacked signup credits: ${t.unbacked_signup_credits} · scanned to block ${esc(t.cursor_block ?? '—')}</p>
-      <button class="btn small ghost" data-admin="poll">Scan the chain now</button>
+      <p class="small muted">NEAR for gas: ${esc(t.near_balance ?? '—')} · unclaimed deposits: ${t.unclaimed_deposits} · deposit reports waiting: ${t.pending_reports} · indexer: ${esc(t.indexer)} · storage registered: ${t.treasury_registered == null ? '—' : t.treasury_registered ? 'yes' : '<b class="neg">no</b>'} · unbacked signup credits: ${t.unbacked_signup_credits}</p>
+      <button class="btn small ghost" data-admin="poll">Check NEAR now</button>
       <h3>Pay out house earnings</h3>
       <div class="row gap wrap-row"><label>From<select id="payout-source"><option value="fees">house fees (${t.fees.toLocaleString('en-US')})</option><option value="house-agent">house agent earnings</option></select></label>
-      <label>Amount<input id="payout-amount" type="number" min="1" step="1"></label><label>To address<input id="payout-to" placeholder="0x…"></label>
+      <label>Amount<input id="payout-amount" type="number" min="1" step="1"></label><label>To NEAR account<input id="payout-to" placeholder="operator.near"></label>
       <button class="btn small" data-admin="payout">Queue payout</button></div>
       <p class="small muted">Payouts join the withdrawal queue below; approve them there.</p></section>`);
     const open = wd.withdrawals.filter((w) => ['pending', 'signing', 'sending'].includes(w.status));
     const done = wd.withdrawals.filter((w) => !['pending', 'signing', 'sending'].includes(w.status)).slice(0, 30);
     const row = (w) => `<tr><td>${when(w.created_at)}</td><td><a href="/u/${esc(w.account_name)}">${esc(w.account_name)}</a><div class="small muted">wallet linked ${w.wallet_linked_at ? when(w.wallet_linked_at) : '—'}</div></td>
-      <td>${cr(w.amount)}</td><td><code>${esc(w.to_address)}</code></td><td>${esc(w.status)}${w.error ? `<div class="small err">${esc(w.error)}</div>` : ''}${w.note ? `<div class="small muted">${esc(w.note)}</div>` : ''}</td>
+      <td>${cr(w.amount)}</td><td><code>${esc(w.to_account)}</code></td><td>${esc(w.status)}${w.error ? `<div class="small err">${esc(w.error)}</div>` : ''}${w.note ? `<div class="small muted">${esc(w.note)}</div>` : ''}</td>
       <td>${w.explorer_url ? `<a href="${esc(w.explorer_url)}">tx</a>` : ''}</td>
       <td class="stack">${w.status === 'pending' ? `<button class="btn small" data-admin="approve" data-id="${esc(w.id)}">Approve and send</button><button class="btn small danger" data-admin="reject" data-id="${esc(w.id)}">Reject</button>` : ''}
       ${w.status === 'sending' ? `<button class="btn small ghost" data-admin="rebroadcast" data-id="${esc(w.id)}">Rebroadcast</button><button class="btn small danger" data-admin="refund" data-id="${esc(w.id)}">Refund (dropped)</button>` : ''}</td></tr>`;

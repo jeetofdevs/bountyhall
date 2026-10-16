@@ -1,59 +1,90 @@
-// On-chain payments in an ERC-20 token (MUSEBOOK on Robinhood Chain by default).
+// On-chain payments in a NEP-141 token on NEAR Protocol (MUSEBOOK by default).
 //
-// Custodial model: users deposit tokens to the treasury (the hot wallet), the
-// watcher credits them in the internal ledger once the transfer has enough
-// confirmations, and every job then settles instantly off-chain. Withdrawals
-// wait in a queue until an admin approves them; only then does the server sign
-// and broadcast a token transfer.
+// Custodial model: users deposit tokens to the treasury account, the server
+// verifies each deposit transaction on-chain once it is final and credits it in
+// the internal ledger, and every job then settles instantly off-chain.
+// Withdrawals wait in a queue until an admin approves them; only then does the
+// server sign and broadcast an ft_transfer from the treasury.
 //
 // Ledger: 1 credit = 1 whole token. Deposits move sys_chain -> user; a
 // withdrawal request moves user -> sys_withdrawals; confirmation moves
 // sys_withdrawals -> sys_chain; a rejection or refund moves it back to the user.
 // So -balance(sys_chain) is always exactly what the treasury owes on-chain.
 //
-//   withdrawal: pending ─approve─▶ signing ─▶ sending ─mined─▶ confirmed
-//                  │                   │          ├─reverted─▶ failed   (refunded)
-//                  └─reject─▶ rejected └─error─▶ pending        └─dropped─▶ refunded
+//   deposit:    reported (by the depositor or an indexer) ─final─▶ credited | unclaimed | dust
+//   withdrawal: pending ─approve─▶ signing ─▶ sending ─final─▶ confirmed
+//                  │                   │          ├─failed on-chain─▶ failed   (refunded)
+//                  └─reject─▶ rejected └─error─▶ pending  └─dropped─▶ refunded
 import { randomBytes } from 'node:crypto';
-import { getAddress, isAddress } from 'viem';
 import { tx } from './db.js';
 import { SYS } from './market.js';
+import { isAccountId, b58decode, sha256 } from './near.js';
 import { HttpError, newId, now, int, str, MINUTE } from './util.js';
 
+const NETWORKS = {
+  mainnet: { rpcUrl: 'https://free.rpc.fastnear.com', explorer: 'https://nearblocks.io', indexerUrl: 'https://api.nearblocks.io' },
+  testnet: { rpcUrl: 'https://rpc.testnet.fastnear.com', explorer: 'https://testnet.nearblocks.io', indexerUrl: 'https://api-testnet.nearblocks.io' },
+};
+
 export const DEFAULTS = {
-  rpcUrl: 'https://rpc.mainnet.chain.robinhood.com',
-  chainId: 4663,
-  chainName: 'Robinhood Chain',
-  token: '0x91A2DAe9699f0B82540B5886b0d8759C22820bA3',
+  networkId: 'mainnet',
+  networkName: 'NEAR Protocol',
   symbol: 'MUSEBOOK',
-  explorer: 'https://robinhoodchain.blockscout.com',
-  confirmations: 20,
   minWithdrawal: 1000,
 };
 
 export function paymentsConfigFromEnv(env = process.env) {
   const mode = (env.PAYMENTS || 'credits').toLowerCase();
   if (mode !== 'token') return { mode: 'credits' };
+  const networkId = (env.NEAR_NETWORK || DEFAULTS.networkId).toLowerCase();
+  const net = NETWORKS[networkId] || NETWORKS.mainnet;
+  let recipient = env.LINK_RECIPIENT || 'bountyhall.lol';
+  if (!env.LINK_RECIPIENT && env.PUBLIC_URL) { try { recipient = new URL(env.PUBLIC_URL).host; } catch {} }
   return {
     mode: 'token',
-    rpcUrl: env.CHAIN_RPC_URL || DEFAULTS.rpcUrl,
-    chainId: Number(env.CHAIN_ID || DEFAULTS.chainId),
-    chainName: env.CHAIN_NAME || DEFAULTS.chainName,
-    token: env.TOKEN_ADDRESS || DEFAULTS.token,
+    networkId,
+    networkName: networkId === 'mainnet' ? DEFAULTS.networkName : `NEAR Protocol ${networkId}`,
+    rpcUrl: env.NEAR_RPC_URL || net.rpcUrl,
+    token: (env.TOKEN_CONTRACT || '').trim() || null,
     symbol: env.TOKEN_SYMBOL || DEFAULTS.symbol,
-    explorer: (env.EXPLORER_URL || DEFAULTS.explorer).replace(/\/$/, ''),
-    confirmations: Number(env.CONFIRMATIONS || DEFAULTS.confirmations),
+    explorer: (env.EXPLORER_URL || net.explorer).replace(/\/$/, ''),
+    indexerUrl: env.INDEXER_URL === '' ? null : (env.INDEXER_URL || net.indexerUrl).replace(/\/$/, ''),
+    accountId: (env.NEAR_ACCOUNT_ID || '').trim() || null,
+    privateKey: env.HOT_WALLET_PRIVATE_KEY || null,
     minWithdrawal: Number(env.MIN_WITHDRAWAL || DEFAULTS.minWithdrawal),
     maxWithdrawalPerDay: Number(env.MAX_WITHDRAWAL_PER_DAY || 0),
-    fromBlock: env.WATCH_FROM_BLOCK ? BigInt(env.WATCH_FROM_BLOCK) : null,
-    privateKey: env.HOT_WALLET_PRIVATE_KEY || null,
-    depositAddress: env.DEPOSIT_ADDRESS || null,
+    recipient,
   };
 }
 
+// Stand-in used when the configuration is incomplete: the site keeps running and
+// every payment call reports what is missing.
+export function brokenChain(cfg, err) {
+  const fail = async () => { throw err; };
+  return { treasury: cfg.accountId || '(not set)', token: cfg.token || '(not set)', canSend: false, check: fail, depositsIn: fail, signTransfer: fail, broadcast: fail, receipt: fail, dropped: fail, tokenBalance: fail, nativeBalance: fail, verify: fail, recentDepositTxs: async () => [] };
+}
+
 const CHALLENGE_TTL = 10 * MINUTE;
-const SCAN_CHUNK = 2000n;
+const REPORT_TTL = 60 * MINUTE; // stop looking for a reported transaction after this long
+const INDEXER_EVERY = MINUTE;
 const OPEN_WITHDRAWALS = ['pending', 'signing', 'sending'];
+const YOCTO = 10n ** 24n;
+
+const normAccount = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : v);
+const decodeSig = (s) => {
+  if (typeof s !== 'string') return null;
+  try {
+    const bytes = s.startsWith('ed25519:') ? b58decode(s.slice(8)) : Buffer.from(s, 'base64');
+    return bytes.length === 64 ? Uint8Array.from(bytes) : null;
+  } catch { return null; }
+};
+const validHash = (h) => { try { return typeof h === 'string' && b58decode(h).length === 32; } catch { return false; } };
+
+export function formatNear(yocto) {
+  const whole = yocto / YOCTO;
+  const frac = (yocto % YOCTO).toString().padStart(24, '0').slice(0, 4);
+  return `${whole}.${frac}`;
+}
 
 export class Payments {
   constructor(market, chain, cfg, { log = console } = {}) {
@@ -65,6 +96,9 @@ export class Payments {
     this.ready = false;
     this.decimals = null;
     this.lastError = null;
+    this.treasuryRegistered = null;
+    this.lastIndexScan = 0;
+    this.indexerError = null;
     this.queue = Promise.resolve(); // serializes signing so nonces never collide
   }
 
@@ -75,81 +109,111 @@ export class Payments {
     // is safe to put it back in the queue.
     const stuck = this.db.prepare("UPDATE withdrawals SET status = 'pending', error = 'interrupted before signing; back in the queue', updated_at = ? WHERE status = 'signing' AND tx_hash IS NULL").run(now());
     if (stuck.changes) this.log.warn?.(`[payments] ${stuck.changes} interrupted withdrawal(s) returned to the queue`);
+    this.#retireEvmWallets();
     try {
       const info = await this.chain.check();
       this.decimals = info.decimals;
       this.onchainSymbol = info.symbol;
+      this.treasuryRegistered = info.treasuryRegistered;
       this.ready = true;
       this.lastError = null;
       if (info.symbol !== this.cfg.symbol) this.log.warn?.(`[payments] token symbol on-chain is ${info.symbol}, configured ${this.cfg.symbol}`);
+      if (!info.treasuryRegistered) this.log.warn?.(`[payments] ${this.chain.treasury} has no storage registration on ${this.chain.token}; deposits to it will fail`);
       const unbacked = this.market.balance(SYS.faucet);
       if (unbacked !== 0) this.log.warn?.(`[payments] ${-unbacked} free signup credits exist that no token backs; set SIGNUP_CREDITS=0 in token mode`);
     } catch (err) {
       this.ready = false;
       this.lastError = err.message;
-      this.log.error?.(`[payments] chain check failed: ${err.message}`);
+      this.log.error?.(`[payments] NEAR check failed: ${err.message}`);
     }
     return this.ready;
   }
 
+  // Wallets linked when payments ran on an EVM chain cannot receive NEAR
+  // transfers. Unlink them (balances are untouched) and return their queued
+  // withdrawals to the owners.
+  #retireEvmWallets() {
+    const evm = /^0x[0-9a-fA-F]{40}$/;
+    tx(this.db, () => {
+      for (const w of this.db.prepare("SELECT * FROM withdrawals WHERE status = 'pending'").all()) {
+        if (evm.test(w.to_address) && /[A-F]/.test(w.to_address)) this.#refund(w, 'rejected', 'payments moved to NEAR Protocol; link a NEAR account and request again');
+      }
+      const old = this.db.prepare('SELECT account_id, address FROM wallets').all().filter((w) => evm.test(w.address) && /[A-F]/.test(w.address));
+      for (const w of old) this.db.prepare('DELETE FROM wallets WHERE account_id = ?').run(w.account_id);
+      if (old.length) this.log.warn?.(`[payments] unlinked ${old.length} EVM wallet(s) left from before the move to NEAR`);
+      this.db.prepare("DELETE FROM wallet_challenges WHERE address LIKE '0x%' AND length(address) = 42").run();
+    });
+  }
+
   #needReady() {
-    if (!this.ready) throw new HttpError(503, `payments are temporarily unavailable: ${this.lastError || 'chain not checked yet'}`, 'chain_unavailable');
+    if (!this.ready) throw new HttpError(503, `payments are temporarily unavailable: ${this.lastError || 'NEAR not checked yet'}`, 'chain_unavailable');
   }
 
   unit() { return 10n ** BigInt(this.decimals); }
 
   publicConfig() {
     return {
-      mode: 'token', symbol: this.cfg.symbol, token: this.chain.token, chain_id: this.cfg.chainId, chain_name: this.cfg.chainName,
-      rpc_url: this.cfg.rpcUrl, explorer: this.cfg.explorer, decimals: this.decimals, deposit_address: this.chain.treasury,
-      confirmations: this.cfg.confirmations, min_withdrawal: this.cfg.minWithdrawal, max_withdrawal_per_day: this.cfg.maxWithdrawalPerDay || null,
-      withdrawals: 'reviewed by an admin', ready: this.ready,
+      mode: 'token', symbol: this.cfg.symbol, token_contract: this.chain.token, network: this.cfg.networkName, network_id: this.cfg.networkId,
+      rpc_url: this.cfg.rpcUrl, explorer: this.cfg.explorer, decimals: this.decimals, deposit_account: this.chain.treasury,
+      finality: 'final', min_withdrawal: this.cfg.minWithdrawal, max_withdrawal_per_day: this.cfg.maxWithdrawalPerDay || null,
+      link_recipient: this.cfg.recipient, withdrawals: 'reviewed by an admin', ready: this.ready,
     };
   }
 
+  explorerTx = (hash) => `${this.cfg.explorer}/txns/${hash}`;
+  explorerAccount = (id) => `${this.cfg.explorer}/address/${id}`;
+
   // ---------- wallets ----------
   wallet(accountId) {
-    return this.db.prepare('SELECT address, linked_at FROM wallets WHERE account_id = ?').get(accountId) || null;
+    return this.db.prepare('SELECT address AS account_id, linked_at FROM wallets WHERE account_id = ?').get(accountId) || null;
   }
 
-  challenge(me, address) {
-    if (typeof address !== 'string' || !isAddress(address)) throw new HttpError(400, 'address must be a 0x wallet address', 'invalid_input');
-    const addr = getAddress(address);
+  // NEP-413: the wallet signs { message, nonce, recipient } off-chain. No transaction, no gas.
+  challenge(me, accountIdInput) {
+    const id = normAccount(accountIdInput);
+    if (!isAccountId(id)) throw new HttpError(400, 'account_id must be a NEAR account, like alice.near', 'invalid_input');
     const expires = now() + CHALLENGE_TTL;
     const message = [
       'Bountyhall wallet link',
       `Account: ${me.name} (${me.id})`,
-      `Address: ${addr}`,
-      `Chain: ${this.cfg.chainId}`,
+      `NEAR account: ${id}`,
+      `Network: ${this.cfg.networkId}`,
       `Nonce: ${randomBytes(16).toString('hex')}`,
       `Expires: ${new Date(expires).toISOString()}`,
     ].join('\n');
-    this.db.prepare('INSERT OR REPLACE INTO wallet_challenges (account_id, address, message, expires_at) VALUES (?, ?, ?, ?)').run(me.id, addr, message, expires);
-    return { address: addr, message, expires_at: expires };
+    this.db.prepare('INSERT OR REPLACE INTO wallet_challenges (account_id, address, message, expires_at) VALUES (?, ?, ?, ?)').run(me.id, id, message, expires);
+    return { account_id: id, message, nonce: Buffer.from(sha256(Buffer.from(message))).toString('base64'), recipient: this.cfg.recipient, expires_at: expires };
   }
 
-  async link(me, { address, signature }) {
-    if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]+$/.test(signature)) throw new HttpError(400, 'signature must be a 0x hex string', 'invalid_input');
-    if (typeof address !== 'string' || !isAddress(address)) throw new HttpError(400, 'address must be a 0x wallet address', 'invalid_input');
-    const addr = getAddress(address);
+  async link(me, body = {}) {
+    const id = normAccount(body.account_id ?? body.accountId);
+    const publicKey = body.public_key ?? body.publicKey;
+    if (!isAccountId(id)) throw new HttpError(400, 'account_id must be a NEAR account, like alice.near', 'invalid_input');
+    if (typeof publicKey !== 'string' || !/^ed25519:[1-9A-HJ-NP-Za-km-z]{40,50}$/.test(publicKey)) throw new HttpError(400, 'public_key must be an ed25519:… key', 'invalid_input');
+    const signature = decodeSig(body.signature);
+    if (!signature) throw new HttpError(400, 'signature must be a 64-byte ed25519 signature in base64', 'invalid_input');
     const ch = this.db.prepare('SELECT * FROM wallet_challenges WHERE account_id = ?').get(me.id);
-    if (!ch || ch.address !== addr) throw new HttpError(400, 'request a challenge for this address first', 'no_challenge');
+    if (!ch || ch.address !== id) throw new HttpError(400, 'request a challenge for this NEAR account first', 'no_challenge');
     if (now() > ch.expires_at) throw new HttpError(400, 'the challenge expired; request a new one', 'challenge_expired');
     // single use: a challenge is spent by any attempt, right or wrong
     this.db.prepare('DELETE FROM wallet_challenges WHERE account_id = ?').run(me.id);
     let valid = false;
-    try { valid = await this.chain.verify(addr, ch.message, signature); } catch { valid = false; }
-    if (!valid) throw new HttpError(400, 'signature does not match the address', 'bad_signature');
+    try {
+      valid = await this.chain.verify({ accountId: id, publicKey, signature, message: ch.message, nonce: sha256(Buffer.from(ch.message)), recipient: this.cfg.recipient });
+    } catch (err) {
+      throw new HttpError(503, `could not check the key on NEAR: ${err.message}`, 'chain_unavailable');
+    }
+    if (!valid) throw new HttpError(400, 'signature does not match, or the key is not a full-access key of that account', 'bad_signature');
     return tx(this.db, () => {
-      const owner = this.db.prepare('SELECT account_id FROM wallets WHERE address = ?').get(addr);
-      if (owner && owner.account_id !== me.id) throw new HttpError(409, 'that wallet is linked to another account', 'wallet_taken');
+      const owner = this.db.prepare('SELECT account_id FROM wallets WHERE address = ?').get(id);
+      if (owner && owner.account_id !== me.id) throw new HttpError(409, 'that NEAR account is linked to another Bountyhall account', 'wallet_taken');
       const open = this.db.prepare(`SELECT COUNT(*) AS c FROM withdrawals WHERE account_id = ? AND status IN (${OPEN_WITHDRAWALS.map(() => '?').join(',')})`).get(me.id, ...OPEN_WITHDRAWALS).c;
       if (open) throw new HttpError(409, 'you cannot change wallets while a withdrawal is open', 'withdrawal_open');
-      this.db.prepare('INSERT INTO wallets (account_id, address, linked_at) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET address = excluded.address, linked_at = excluded.linked_at').run(me.id, addr, now());
-      // deposits that arrived from this address before it was linked
-      const claimed = this.db.prepare("SELECT * FROM deposits WHERE from_address = ? AND status = 'unclaimed'").all(addr);
+      this.db.prepare('INSERT INTO wallets (account_id, address, linked_at) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET address = excluded.address, linked_at = excluded.linked_at').run(me.id, id, now());
+      // deposits that arrived from this account before it was linked
+      const claimed = this.db.prepare("SELECT * FROM deposits WHERE from_address = ? AND status = 'unclaimed'").all(id);
       for (const d of claimed) this.#credit(d, me.id);
-      return { address: addr, linked_at: now(), claimed_deposits: claimed.length, claimed_amount: claimed.reduce((a, d) => a + d.credited, 0) };
+      return { account_id: id, linked_at: now(), claimed_deposits: claimed.length, claimed_amount: claimed.reduce((a, d) => a + d.credited, 0) };
     });
   }
 
@@ -159,44 +223,93 @@ export class Payments {
   }
 
   // ---------- deposits ----------
-  #recordDeposit(log) {
-    const credited = log.value / this.unit();
-    if (credited > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`deposit too large to credit: ${log.value}`);
+  #recordDeposit(txHash, index, from, value) {
+    const credited = value / this.unit();
+    if (credited > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`deposit too large to credit: ${value}`);
     const id = newId('dep');
-    const from = getAddress(log.from);
     const r = this.db.prepare(`INSERT OR IGNORE INTO deposits (id, tx_hash, log_index, block_number, from_address, raw_amount, credited, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?)`).run(id, log.txHash, Number(log.logIndex), Number(log.blockNumber), from, log.value.toString(), Number(credited), now());
-    if (!r.changes) return false; // already seen
+      VALUES (?, ?, ?, 0, ?, ?, ?, 'new', ?)`).run(id, txHash, index, from, value.toString(), Number(credited), now());
+    if (!r.changes) return null; // already recorded
     const d = this.db.prepare('SELECT * FROM deposits WHERE id = ?').get(id);
-    if (d.credited === 0) { this.db.prepare("UPDATE deposits SET status = 'dust' WHERE id = ?").run(id); return true; }
+    if (d.credited === 0) { this.db.prepare("UPDATE deposits SET status = 'dust' WHERE id = ?").run(id); return 'dust'; }
     const owner = this.db.prepare('SELECT account_id FROM wallets WHERE address = ?').get(from);
-    if (owner) this.#credit(d, owner.account_id);
-    else this.db.prepare("UPDATE deposits SET status = 'unclaimed' WHERE id = ?").run(id);
-    return true;
+    if (owner) { this.#credit(d, owner.account_id); return 'credited'; }
+    this.db.prepare("UPDATE deposits SET status = 'unclaimed' WHERE id = ?").run(id);
+    return 'unclaimed';
+  }
+
+  // Anyone may point the server at a transaction; what gets credited, and to
+  // whom, is decided only by what the transaction did on-chain.
+  async reportDeposit(me, body = {}) {
+    this.#needReady();
+    const hash = typeof body.tx_hash === 'string' ? body.tx_hash.trim() : body.tx_hash;
+    if (!validHash(hash)) throw new HttpError(400, 'tx_hash must be a NEAR transaction hash (base58)', 'invalid_input');
+    const sender = normAccount(body.sender ?? this.wallet(me.id)?.account_id);
+    if (!isAccountId(sender)) throw new HttpError(400, 'sender must be the NEAR account that signed the transaction (defaults to your linked account)', 'invalid_input');
+    this.db.prepare("INSERT OR IGNORE INTO deposit_reports (tx_hash, sender, reported_by, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)").run(hash, sender, me.id, now(), now());
+    const row = this.db.prepare('SELECT * FROM deposit_reports WHERE tx_hash = ?').get(hash);
+    if (row.status === 'pending') await this.#checkReport(row).catch((err) => this.#noteReport(hash, err.message));
+    return this.depositReport(hash);
+  }
+
+  depositReport(hash) {
+    const r = this.db.prepare('SELECT tx_hash, sender, status, error, attempts, created_at, updated_at FROM deposit_reports WHERE tx_hash = ?').get(hash);
+    if (!r) throw new HttpError(404, 'no report for that transaction', 'not_found');
+    const deposits = this.db.prepare('SELECT id, from_address AS from_account, credited, status FROM deposits WHERE tx_hash = ? ORDER BY log_index').all(hash);
+    return { ...r, deposits, explorer_url: this.explorerTx(hash) };
+  }
+
+  #noteReport(hash, error) {
+    this.db.prepare('UPDATE deposit_reports SET error = ?, attempts = attempts + 1, updated_at = ? WHERE tx_hash = ?').run(error, now(), hash);
+  }
+
+  async #checkReport(row) {
+    let res = await this.chain.depositsIn(row.tx_hash, row.sender);
+    // the hash may have been reported with the wrong sender; the linked account of the reporter is the next best guess
+    if (res === null && row.reported_by) {
+      const alt = this.wallet(row.reported_by)?.account_id;
+      if (alt && alt !== row.sender) { res = await this.chain.depositsIn(row.tx_hash, alt); if (res) this.db.prepare('UPDATE deposit_reports SET sender = ? WHERE tx_hash = ?').run(alt, row.tx_hash); }
+    }
+    if (res === null || !res.final) {
+      const expired = now() - row.created_at > REPORT_TTL;
+      this.db.prepare('UPDATE deposit_reports SET status = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE tx_hash = ?')
+        .run(expired ? 'not_found' : 'pending', res === null ? 'transaction not found on NEAR yet' : 'waiting for finality', now(), row.tx_hash);
+      return;
+    }
+    tx(this.db, () => {
+      const transfers = [...res.transfers].sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+      transfers.forEach((t, i) => this.#recordDeposit(row.tx_hash, i, t.from, t.value));
+      this.db.prepare('UPDATE deposit_reports SET status = ?, error = ?, attempts = attempts + 1, updated_at = ? WHERE tx_hash = ?')
+        .run(transfers.length ? 'done' : 'no_deposit', transfers.length ? null : `no ${this.cfg.symbol} reached ${this.chain.treasury} in this transaction`, now(), row.tx_hash);
+    });
   }
 
   async scanDeposits() {
-    const head = await this.chain.head();
-    const safe = head - BigInt(this.cfg.confirmations);
-    if (safe < 0n) return 0;
-    const stored = this.db.prepare("SELECT v FROM meta WHERE k = 'chain_cursor'").get()?.v;
-    let cursor = stored != null ? BigInt(stored) : (this.cfg.fromBlock != null ? this.cfg.fromBlock - 1n : safe);
-    if (stored == null) this.db.prepare("INSERT OR REPLACE INTO meta (k, v) VALUES ('chain_cursor', ?)").run(cursor.toString());
     let found = 0;
-    while (cursor < safe) {
-      const to = cursor + SCAN_CHUNK < safe ? cursor + SCAN_CHUNK : safe;
-      const logs = await this.chain.transfersTo(cursor + 1n, to);
-      tx(this.db, () => {
-        for (const log of logs) if (this.#recordDeposit(log)) found++;
-        this.db.prepare("UPDATE meta SET v = ? WHERE k = 'chain_cursor'").run(to.toString());
-      });
-      cursor = to;
+    if (this.cfg.indexerUrl !== null && now() - this.lastIndexScan >= INDEXER_EVERY) {
+      this.lastIndexScan = now();
+      try {
+        for (const h of await this.chain.recentDepositTxs()) {
+          const r = this.db.prepare("INSERT OR IGNORE INTO deposit_reports (tx_hash, sender, status, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?)").run(h.txHash, h.sender, now(), now());
+          found += r.changes;
+        }
+        this.indexerError = null;
+      } catch (err) {
+        this.indexerError = err.message; // only a hint source: never blocks payments
+      }
     }
+    const pending = this.db.prepare("SELECT * FROM deposit_reports WHERE status = 'pending' ORDER BY created_at LIMIT 50").all();
+    for (const row of pending) await this.#checkReport(row);
     return found;
   }
 
   deposits(accountId, limit = 50) {
-    return this.db.prepare('SELECT id, tx_hash, block_number, from_address, raw_amount, credited, status, created_at FROM deposits WHERE account_id = ? ORDER BY created_at DESC LIMIT ?').all(accountId, limit);
+    return this.db.prepare('SELECT id, tx_hash, from_address AS from_account, raw_amount, credited, status, created_at FROM deposits WHERE account_id = ? ORDER BY created_at DESC LIMIT ?').all(accountId, limit)
+      .map((d) => ({ ...d, explorer_url: this.explorerTx(d.tx_hash) }));
+  }
+
+  depositReports(accountId, limit = 20) {
+    return this.db.prepare("SELECT tx_hash, sender, status, error, created_at FROM deposit_reports WHERE reported_by = ? AND status != 'done' ORDER BY created_at DESC LIMIT ?").all(accountId, limit);
   }
 
   // ---------- withdrawals ----------
@@ -205,7 +318,7 @@ export class Payments {
     const amount = int(input.amount, 'amount', { min: this.cfg.minWithdrawal, max: Number.MAX_SAFE_INTEGER });
     return tx(this.db, () => {
       const w = this.wallet(me.id);
-      if (!w) throw new HttpError(409, 'link a wallet first; withdrawals only go to your linked wallet', 'no_wallet');
+      if (!w) throw new HttpError(409, 'link a NEAR account first; withdrawals only go to your linked account', 'no_wallet');
       if (this.market.balance(me.id) < amount) throw new HttpError(402, 'insufficient balance', 'insufficient_funds');
       if (this.cfg.maxWithdrawalPerDay) {
         const used = Number(this.db.prepare("SELECT COALESCE(SUM(amount), 0) AS s FROM withdrawals WHERE account_id = ? AND created_at > ? AND status NOT IN ('rejected', 'failed', 'refunded')").get(me.id, now() - 24 * 60 * MINUTE).s);
@@ -214,24 +327,25 @@ export class Payments {
       const id = newId('wd');
       const t = now();
       this.db.prepare(`INSERT INTO withdrawals (id, account_id, to_address, amount, raw_amount, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`).run(id, me.id, w.address, amount, (BigInt(amount) * this.unit()).toString(), t, t);
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`).run(id, me.id, w.account_id, amount, (BigInt(amount) * this.unit()).toString(), t, t);
       this.market.transfer([[me.id, -amount], [SYS.withdrawals, amount]], 'withdrawal requested');
       return this.withdrawal(id);
     });
   }
 
   // Operator payout: move house fees (or another system-owned account, like the
-  // house agent's earnings) to any address. Goes through the same review queue.
+  // house agent's earnings) to any NEAR account. Goes through the same review queue.
   requestOperatorWithdrawal(accountId, { amount, to }) {
     this.#needReady();
     const n = int(amount, 'amount', { min: 1, max: Number.MAX_SAFE_INTEGER });
-    if (typeof to !== 'string' || !isAddress(to)) throw new HttpError(400, 'to must be a 0x wallet address', 'invalid_input');
+    const dest = normAccount(to);
+    if (!isAccountId(dest)) throw new HttpError(400, 'to must be a NEAR account, like alice.near', 'invalid_input');
     return tx(this.db, () => {
       if (this.market.balance(accountId) < n) throw new HttpError(402, `that account holds ${this.market.balance(accountId)}`, 'insufficient_funds');
       const id = newId('wd');
       const t = now();
       this.db.prepare(`INSERT INTO withdrawals (id, account_id, to_address, amount, raw_amount, status, note, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', 'operator payout', ?, ?)`).run(id, accountId, getAddress(to), n, (BigInt(n) * this.unit()).toString(), t, t);
+        VALUES (?, ?, ?, ?, ?, 'pending', 'operator payout', ?, ?)`).run(id, accountId, dest, n, (BigInt(n) * this.unit()).toString(), t, t);
       this.market.transfer([[accountId, -n], [SYS.withdrawals, n]], 'operator payout requested');
       return this.withdrawal(id);
     });
@@ -240,8 +354,8 @@ export class Payments {
   withdrawal(id) {
     const w = this.db.prepare('SELECT w.*, a.name AS account_name FROM withdrawals w JOIN accounts a ON a.id = w.account_id WHERE w.id = ?').get(id);
     if (!w) throw new HttpError(404, 'withdrawal not found', 'not_found');
-    const { raw_tx, ...rest } = w;
-    return { ...rest, explorer_url: w.tx_hash ? `${this.cfg.explorer}/tx/${w.tx_hash}` : null };
+    const { raw_tx, to_address, ref_block, ...rest } = w;
+    return { ...rest, to_account: to_address, explorer_url: w.tx_hash ? this.explorerTx(w.tx_hash) : null };
   }
 
   withdrawals({ accountId, status, limit = 100 } = {}) {
@@ -294,19 +408,21 @@ export class Payments {
     try {
       const raw = BigInt(w.raw_amount);
       const have = await this.chain.tokenBalance(this.chain.treasury);
-      if (have < raw) throw new Error(`hot wallet holds ${have / this.unit()} ${this.cfg.symbol}, needs ${w.amount}`);
-      signed = await this.chain.signTransfer(w.to_address, raw);
+      if (have < raw) throw new Error(`the treasury holds ${have / this.unit()} ${this.cfg.symbol}, needs ${w.amount}`);
+      // a nonce above every transfer already signed, even ones not yet on-chain
+      const minNonce = Number(this.db.prepare('SELECT COALESCE(MAX(nonce), 0) AS n FROM withdrawals WHERE tx_hash IS NOT NULL').get().n);
+      signed = await this.chain.signTransfer(w.to_address, raw, { minNonce, memo: `Bountyhall withdrawal ${w.id}` });
     } catch (err) {
       // nothing left the building: put it back in the queue
-      this.#setWithdrawal(w.id, { status: 'pending', error: err.shortMessage || err.message });
-      throw new HttpError(502, `could not sign the transfer: ${err.shortMessage || err.message}`, 'send_failed');
+      this.#setWithdrawal(w.id, { status: 'pending', error: err.message });
+      throw new HttpError(502, `could not sign the transfer: ${err.message}`, 'send_failed');
     }
     // record the hash before broadcasting, so a crash can never lose track of a sent transfer
-    this.#setWithdrawal(w.id, { status: 'sending', tx_hash: signed.hash, nonce: signed.nonce, raw_tx: signed.raw });
+    this.#setWithdrawal(w.id, { status: 'sending', tx_hash: signed.hash, nonce: signed.nonce, raw_tx: signed.raw, ref_block: signed.blockHash });
     try {
       await this.chain.broadcast(signed.raw);
     } catch (err) {
-      this.#setWithdrawal(w.id, { error: `broadcast failed: ${err.shortMessage || err.message}` });
+      this.#setWithdrawal(w.id, { error: `broadcast failed: ${err.message}` });
     }
     return this.withdrawal(w.id);
   }
@@ -316,20 +432,24 @@ export class Payments {
     if (!w) throw new HttpError(404, 'withdrawal not found', 'not_found');
     if (w.status !== 'sending') throw new HttpError(409, 'only withdrawals that are sending can be rebroadcast', 'invalid_state');
     try { await this.chain.broadcast(w.raw_tx); this.#setWithdrawal(id, { error: null }); } catch (err) {
-      this.#setWithdrawal(id, { error: `rebroadcast failed: ${err.shortMessage || err.message}` });
+      this.#setWithdrawal(id, { error: `rebroadcast failed: ${err.message}` });
     }
     return this.withdrawal(id);
   }
 
-  // Refund a transfer that will never be mined: it is unknown to the chain and
-  // its nonce has already been used by another transaction.
+  // Refund a transfer that can never be included: unknown to the chain, and its
+  // nonce is spent or its block hash has expired.
   async refundDropped(id) {
     const w = this.db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
     if (!w) throw new HttpError(404, 'withdrawal not found', 'not_found');
     if (w.status !== 'sending') throw new HttpError(409, 'only withdrawals that are sending can be refunded', 'invalid_state');
-    if (await this.chain.receipt(w.tx_hash)) throw new HttpError(409, 'that transfer was mined; wait for the watcher to settle it', 'mined');
-    if (await this.chain.txExists(w.tx_hash)) throw new HttpError(409, 'that transfer is still pending on-chain', 'still_pending');
-    if ((await this.chain.confirmedNonce()) <= w.nonce) throw new HttpError(409, 'its nonce is unused, so it could still be mined: rebroadcast it instead', 'nonce_unused');
+    const before = await this.chain.receipt(w.tx_hash);
+    if (before) throw new HttpError(409, before.status === 'pending' ? 'that transfer is on-chain and still executing' : 'that transfer is on-chain; wait for the watcher to settle it', before.status === 'pending' ? 'still_pending' : 'mined');
+    const verdict = await this.chain.dropped({ nonce: w.nonce, blockHash: w.ref_block });
+    if (verdict === 'too_old') throw new HttpError(409, 'this transfer is older than the RPC history: check it on the explorer, or point NEAR_RPC_URL at an archival node', 'too_old');
+    if (!verdict) throw new HttpError(409, 'it could still be included: rebroadcast it instead', 'not_dropped');
+    // look once more, so a transfer included a moment ago is never refunded
+    if (await this.chain.receipt(w.tx_hash)) throw new HttpError(409, 'that transfer just landed on-chain', 'mined');
     return tx(this.db, () => {
       const row = this.db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(id);
       if (row.status !== 'sending') throw new HttpError(409, `withdrawal is ${row.status}`, 'invalid_state');
@@ -340,12 +460,10 @@ export class Payments {
 
   async trackWithdrawals() {
     const sending = this.db.prepare("SELECT * FROM withdrawals WHERE status = 'sending'").all();
-    if (!sending.length) return 0;
-    const head = await this.chain.head();
     let settled = 0;
     for (const w of sending) {
       const r = await this.chain.receipt(w.tx_hash);
-      if (!r || head - r.blockNumber < BigInt(this.cfg.confirmations)) continue;
+      if (!r || !r.final || r.status === 'pending') continue;
       tx(this.db, () => {
         const row = this.db.prepare('SELECT * FROM withdrawals WHERE id = ?').get(w.id);
         if (row.status !== 'sending') return;
@@ -353,7 +471,7 @@ export class Payments {
           this.market.transfer([[SYS.withdrawals, -row.amount], [SYS.chain, row.amount]], 'withdrawal sent');
           this.#setWithdrawal(row.id, { status: 'confirmed', error: null });
         } else {
-          this.#refund(row, 'failed', 'the transfer reverted on-chain; refunded to the account');
+          this.#refund(row, 'failed', 'the transfer failed on-chain; refunded to the account');
         }
       });
       settled++;
@@ -369,7 +487,7 @@ export class Payments {
       this.lastError = null;
       return { ready: true, deposits, withdrawals };
     } catch (err) {
-      this.lastError = err.shortMessage || err.message;
+      this.lastError = err.message;
       this.log.error?.(`[payments] poll failed: ${this.lastError}`);
       return { ready: true, error: this.lastError };
     }
@@ -379,17 +497,18 @@ export class Payments {
   async treasury() {
     const owed = -this.market.balance(SYS.chain);
     const out = {
-      address: this.chain.treasury, symbol: this.cfg.symbol, ready: this.ready, last_error: this.lastError,
+      account: this.chain.treasury, token_contract: this.chain.token, symbol: this.cfg.symbol, ready: this.ready, last_error: this.lastError,
       owed_total: owed, held_by_users: null, in_escrow: this.market.balance(SYS.escrow), fees: this.market.balance(SYS.fees),
       pending_withdrawals: this.market.balance(SYS.withdrawals), unbacked_signup_credits: -this.market.balance(SYS.faucet),
       unclaimed_deposits: Number(this.db.prepare("SELECT COALESCE(SUM(credited), 0) AS s FROM deposits WHERE status = 'unclaimed'").get().s),
-      cursor_block: this.db.prepare("SELECT v FROM meta WHERE k = 'chain_cursor'").get()?.v ?? null,
+      pending_reports: this.db.prepare("SELECT COUNT(*) AS c FROM deposit_reports WHERE status = 'pending'").get().c,
+      treasury_registered: this.treasuryRegistered, indexer: this.cfg.indexerUrl ? (this.indexerError ? `error: ${this.indexerError}` : 'ok') : 'off',
     };
     out.held_by_users = owed - out.in_escrow - out.fees - out.pending_withdrawals;
     if (this.ready) {
-      const [tokens, gas] = await Promise.all([this.chain.tokenBalance(this.chain.treasury), this.chain.nativeBalance(this.chain.treasury)]);
+      const [tokens, near] = await Promise.all([this.chain.tokenBalance(this.chain.treasury), this.chain.nativeBalance(this.chain.treasury)]);
       out.onchain_balance = Number(tokens / this.unit());
-      out.gas_balance_wei = gas.toString();
+      out.near_balance = formatNear(near);
       out.solvent = out.onchain_balance >= owed;
       out.surplus = out.onchain_balance - owed;
     }

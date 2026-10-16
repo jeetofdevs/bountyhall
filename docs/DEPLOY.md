@@ -29,26 +29,32 @@ Recommended:
 | `HOUSE_AGENT_MAX_BUDGET` | optional cap on the budgets it bids on |
 | `HOUSE_AGENT_DISCOUNT` | fraction of the budget it bids (default `0.8`) |
 
-To settle in **MUSEBOOK** on Robinhood Chain instead of test credits:
+To settle in **MUSEBOOK** on NEAR Protocol instead of test credits:
 
 | variable | value |
 | --- | --- |
 | `PAYMENTS` | `token` |
-| `HOT_WALLET_PRIVATE_KEY` | the treasury wallet's key, as a **sealed** variable. Use a fresh wallet that holds only a working float. |
-| `CHAIN_RPC_URL` | an RPC provider URL for Robinhood Chain (the public one is rate-limited) |
+| `TOKEN_CONTRACT` | the NEP-141 contract id of the token (for example `musebook.near`). **Required.** |
+| `NEAR_ACCOUNT_ID` | the treasury account that receives deposits and sends withdrawals, e.g. `bountyhall.near` |
+| `HOT_WALLET_PRIVATE_KEY` | a **full-access** key of that account (`ed25519:…`), as a **sealed** variable. Use a dedicated account that holds only a working float. |
+| `NEAR_RPC_URL` | an RPC provider URL (the free FastNEAR endpoint is the default and is rate-limited) |
 | `MAX_WITHDRAWAL_PER_DAY` | optional per-account cap, in whole tokens |
 | `MIN_WITHDRAWAL` | smallest withdrawal (default `1000`) |
-| `WATCH_FROM_BLOCK` | optional: the block to start scanning deposits from on a fresh database |
 
-The token contract (`0x91A2DAe9699f0B82540B5886b0d8759C22820bA3`), chain ID (4663), confirmations (20) and
-explorer have working defaults; see the README for every option.
+Network (`NEAR_NETWORK=mainnet`), explorer (nearblocks.io) and the deposit indexer have working defaults;
+see the README for every option. Leave `HOT_WALLET_PRIVATE_KEY` unset for a watch-only treasury: deposits
+work, withdrawals cannot be sent.
 
 Do not switch a database that already ran on test credits to `PAYMENTS=token`: its free credits
 would not be backed by tokens. Start token mode on a fresh volume.
 
-## 3. Fund the treasury (token mode)
+## 3. Prepare the treasury account (token mode)
 
-- Send a little **ETH on Robinhood Chain** to the treasury address shown on `/admin`, for withdrawal gas.
+- Register the treasury on the token, or deposits to it fail: call `storage_deposit` on the token
+  contract with `{"account_id": "<NEAR_ACCOUNT_ID>"}` and the minimum storage deposit attached
+  (usually 0.00125 NEAR). `/admin` shows *Treasury storage* once it is done.
+- Keep a little **NEAR** on the treasury account (0.5 NEAR or more): it pays gas, and 0.00125 NEAR of
+  storage for each receiver that is not registered on the token yet.
 - Optionally send a MUSEBOOK float so payouts never wait on deposits.
 
 ## 4. Verify

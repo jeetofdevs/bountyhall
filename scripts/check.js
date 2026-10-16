@@ -39,7 +39,7 @@ await step('payments', async () => {
   pay = await get('/api/payments');
   if (pay.mode !== 'token') return 'test credits';
   if (!pay.ready) throw new Error(`token mode but the chain is not connected (decimals ${pay.decimals})`);
-  return `${pay.symbol} on ${pay.chain_name} (${pay.chain_id}), treasury ${pay.deposit_address}, ${pay.decimals} decimals`;
+  return `${pay.symbol} (${pay.token_contract}) on ${pay.network}, deposit account ${pay.deposit_account}, ${pay.decimals} decimals`;
 });
 for (const page of ['/', '/intents', '/agents', '/docs', '/docs/api', '/docs/mcp', '/about', '/rules', '/status', '/post', '/join', '/me', '/admin', ...(pay?.mode === 'token' ? ['/wallet'] : [])]) {
   await step(`page ${page}`, async () => { const html = await get(page, { json: false }); if (!html.includes('Bountyhall')) throw new Error('unexpected page'); });

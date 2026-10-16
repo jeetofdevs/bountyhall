@@ -12,7 +12,8 @@ src/house-agent.js  the house solver: triages open intents with Claude, bids, de
 src/mcp.js          stateless MCP server: the marketplace as tools
 src/webhooks.js     signed outbound webhooks with SSRF guards
 src/payments.js     token payments: wallet linking, deposit watcher, withdrawal queue, solvency
-src/chain.js        the only code that talks to the blockchain (viem)
+src/near.js         NEAR primitives: base58, borsh, transaction signing, NEP-413 (node:crypto only)
+src/chain.js        the only code that talks to NEAR (JSON-RPC)
 src/db.js           SQLite schema (node:sqlite) and the transaction helper
 src/views.js        server-rendered HTML (home, intents, profiles, docs, about, rules, status, admin)
 src/docs.js         the docs site: loads content/docs/*.md, fills live values, builds the sidebar
@@ -65,13 +66,15 @@ In token mode (`PAYMENTS=token`) the ledger unit is one whole token and two more
 | withdrawal confirmed on-chain | outbox −N → treasury +N |
 | withdrawal rejected / reverted / dropped | outbox −N → user +N |
 
-So `−balance(treasury)` is exactly what the hot wallet must hold on-chain, and the admin desk compares
-the two. Withdrawal states: `pending → signing → sending → confirmed`, with `rejected`, `failed` (reverted,
-refunded) and `refunded` (dropped: unknown to the chain *and* its nonce used by another transaction, so it
-can never be mined). The signed transaction and its hash are stored before broadcasting, so a crash cannot
+So `−balance(treasury)` is exactly what the treasury account must hold on NEAR, and the admin desk compares
+the two. Withdrawal states: `pending → signing → sending → confirmed`, with `rejected`, `failed` (failed
+on-chain, refunded) and `refunded` (dropped: unknown to the chain *and* its nonce spent or its block hash
+expired, so it can never be included; if the RPC has pruned that history the refund is refused). The signed transaction and its hash are stored before broadcasting, so a crash cannot
 lose track of a transfer; a row caught in `signing` without a hash goes back to `pending` on restart.
-Signing is serialized so nonces never collide. Deposits are keyed by `(tx_hash, log_index)` and are only
-read `CONFIRMATIONS` blocks behind the head.
+Signing is serialized and every nonce is above all nonces already signed, so they never collide. NEAR has
+no log query, so deposits are found by transaction hash (reported by the depositor, or hinted by an
+indexer) and read with `EXPERIMENTAL_tx_status` only once `FINAL`; the net NEP-141 `ft_transfer` events into
+the treasury are credited, keyed by `(tx_hash, index)`.
 
 ## Trust
 

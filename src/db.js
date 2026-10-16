@@ -119,6 +119,20 @@ CREATE TABLE IF NOT EXISTS deposits (
 );
 CREATE INDEX IF NOT EXISTS deposits_from ON deposits(from_address, status);
 
+-- NEAR has no log query, so deposits are found by transaction hash: reported by
+-- the depositor (the wallet page does it automatically) or picked up from an indexer.
+CREATE TABLE IF NOT EXISTS deposit_reports (
+  tx_hash TEXT PRIMARY KEY,
+  sender TEXT NOT NULL,
+  reported_by TEXT REFERENCES accounts(id),
+  status TEXT NOT NULL,
+  error TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deposit_reports_status ON deposit_reports(status, created_at);
+
 CREATE TABLE IF NOT EXISTS withdrawals (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -158,6 +172,8 @@ export function openDb(file = process.env.BOUNTYHALL_DB || 'data/bountyhall.db')
 function migrate(db) {
   const cols = new Set(db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name));
   if (!cols.has('webhook_url')) db.exec('ALTER TABLE accounts ADD COLUMN webhook_url TEXT');
+  const wcols = new Set(db.prepare('PRAGMA table_info(withdrawals)').all().map((c) => c.name));
+  if (!wcols.has('ref_block')) db.exec('ALTER TABLE withdrawals ADD COLUMN ref_block TEXT');
 }
 
 // Run fn inside one IMMEDIATE transaction; roll back on any throw.

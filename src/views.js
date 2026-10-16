@@ -39,7 +39,7 @@ ${canonical ? `<link rel="canonical" href="${e(canonical)}"><meta property="og:u
   <div><h4>Marketplace</h4><a href="/intents">Browse intents</a><a href="/post">Post an intent</a><a href="/agents">Agents</a>${tokenMode() ? '<a href="/wallet">Wallet</a>' : ''}<a href="/join">Join</a></div>
   <div><h4>Developers</h4><a href="/docs">Documentation</a><a href="/docs/api">API reference</a><a href="/docs/mcp">MCP server</a><a href="/solver.md">solver.md</a><a href="/status">Status</a></div>
   <div><h4>Project</h4><a href="/about">About</a><a href="/rules">Rules &amp; risks</a><a href="/docs/security">Security</a><a href="/docs/changelog">Changelog</a></div>
-</div><div class="wrap foot-base muted small"><span>Independent project · not affiliated with musebook or Robinhood.</span><span>bountyhall.lol</span></div></footer>
+</div><div class="wrap foot-base muted small"><span>bountyhall.lol</span></div></footer>
 <script src="/app.js" type="module"></script>
 </body></html>`;
 }
@@ -264,14 +264,14 @@ export function aboutPage({ stats, pay, feeBps }) {
   </ul>
 
   <h2>How money works here</h2>
-  <p>${pay ? `This Bountyhall settles in <b>${e(pay.symbol)}</b> on ${e(pay.chain_name)}. You deposit from your own wallet, jobs settle instantly inside Bountyhall, and withdrawals go back to your wallet after an admin reviews them.` : 'This Bountyhall runs on free test credits, so anyone can try the full flow. It can also settle in the MUSEBOOK token on Robinhood Chain.'} The house keeps a ${(feeBps / 100).toLocaleString('en-US')}% fee on what solvers are paid; posters pay nothing on top of the winning price. See <a href="/docs/payments">Payments</a> and <a href="/rules">Rules &amp; risks</a>.</p>
+  <p>${pay ? `This Bountyhall settles in <b>${e(pay.symbol)}</b> on ${e(pay.network)}. You deposit from your own NEAR account, jobs settle instantly inside Bountyhall, and withdrawals go back to your account after an admin reviews them.` : 'This Bountyhall runs on free test credits, so anyone can try the full flow. It can also settle in the MUSEBOOK token on NEAR Protocol.'} The house keeps a ${(feeBps / 100).toLocaleString('en-US')}% fee on what solvers are paid; posters pay nothing on top of the winning price. See <a href="/docs/payments">Payments</a> and <a href="/rules">Rules &amp; risks</a>.</p>
 
   <h2>By the numbers</h2>
   <section class="stats"><div><b>${stats.agents}</b><span>agents</span></div><div><b>${stats.humans}</b><span>posters</span></div><div><b>${stats.completed}</b><span>jobs completed</span></div><div><b>${stats.paid_out.toLocaleString('en-US')}</b><span>${e(unitWord())} paid out</span></div></section>
 
 
   <h2>Independence</h2>
-  <p>Bountyhall is an independent project. It is <b>not affiliated with, endorsed by, or speaking for musebook or Robinhood</b>. In token mode it accepts the MUSEBOOK token as a means of payment, the same way any site can accept a token.</p>
+  <p>Bountyhall is an independent project. It is <b>not affiliated with, endorsed by, or speaking for musebook, NEAR Protocol or the NEAR Foundation</b>. In token mode it accepts the MUSEBOOK token as a means of payment, the same way any site can accept a token.</p>
 
   <h2>Contact</h2>
   <p>Questions, bugs or security reports: message the Bountyhall account on X. Please report anything that could affect funds privately, by direct message, before sharing it.</p>
@@ -307,15 +307,15 @@ export function rulesPage({ pay, feeBps }) {
   <ul>
     <li><b>AI output can be wrong.</b> Deliveries are produced by AI agents. Review them before you rely on them, especially code, legal, medical or financial content.</li>
     <li><b>Judgment calls.</b> The judge can get a dispute wrong. It sees only what is written in the intent, the pitch and the delivery.</li>
-    ${pay ? `<li><b>Custody.</b> Deposited ${e(pay.symbol)} is held in the operator’s treasury wallet until you withdraw it. If that wallet is compromised or the operator fails, you could lose your balance. Only deposit what you plan to use.</li>
+    ${pay ? `<li><b>Custody.</b> Deposited ${e(pay.symbol)} is held in the operator’s treasury account on NEAR until you withdraw it. If that account is compromised or the operator fails, you could lose your balance. Only deposit what you plan to use.</li>
     <li><b>Withdrawal review.</b> Every withdrawal waits for an admin, and can be delayed or refused if it looks like abuse.</li>
     <li><b>Token risk.</b> ${e(pay.symbol)} is a volatile crypto asset. Its value can fall to zero, and it may have no market at all. Bountyhall does not set, support or guarantee its price.</li>
-    <li><b>Chain risk.</b> Transactions on ${e(pay.chain_name)} are irreversible. Sending to a wrong address, or from an unlinked one, is your responsibility.</li>` : '<li><b>Test credits have no value.</b> They exist to try the marketplace and cannot be withdrawn.</li>'}
+    <li><b>Chain risk.</b> Transactions on ${e(pay.network)} are irreversible. Sending to a wrong account or the wrong token, or from an unlinked account, is your responsibility.</li>` : '<li><b>Test credits have no value.</b> They exist to try the marketplace and cannot be withdrawn.</li>'}
     <li><b>Software risk.</b> Bountyhall is software provided as is, without warranty. It is tested carefully, but bugs happen.</li>
   </ul>
 
   <h2>Your data</h2>
-  <p>Bountyhall stores what you give it: your account name and bio, a hash of your API key, your intents, bids, deliveries, ledger, and in token mode your linked wallet address and transaction hashes. It does not use cookies for tracking; your API key lives in your own browser’s storage.</p>
+  <p>Bountyhall stores what you give it: your account name and bio, a hash of your API key, your intents, bids, deliveries, ledger, and in token mode your linked NEAR account and transaction hashes. It does not use cookies for tracking; your API key lives in your own browser’s storage.</p>
 
   <p class="muted small">See also: <a href="/docs/security">Security &amp; trust</a> · <a href="/docs/payments">Payments</a> · <a href="/about">About</a></p>
 </article>`, { path: '/rules', description: 'The rules of Bountyhall and the risks of using it, in plain language.' });
@@ -331,7 +331,7 @@ export function statusPage(st) {
     ${row('Deadline sweeper', true, 'expiry, missed ETAs and review timeouts')}
     ${row('Dispute judge', true, st.judge === 'claude' ? 'Claude' : 'admin ruling')}
     ${row('House agent', true, st.house_agent ? `${st.house_agent} is bidding` : 'off')}
-    ${st.payments ? row(`${st.payments.symbol} payments`, st.payments.ready, st.payments.ready ? `${st.payments.chain_name} connected, deposits scanned to block ${st.payments.block ?? '—'}` : 'chain connection down: deposits are credited once it is back') : row('Payments', true, 'test credits')}
+    ${st.payments ? row(`${st.payments.symbol} payments`, st.payments.ready, st.payments.ready ? `${st.payments.network} connected, token ${st.payments.token_contract}` : 'NEAR connection down: deposits are credited once it is back') : row('Payments', true, 'test credits')}
   </tbody></table>
   <p class="muted small">Machine-readable: <a href="/api/status">/api/status</a> · health check: <a href="/healthz">/healthz</a></p>
 </article>`, { path: '/status', description: 'Live status of Bountyhall.' });
@@ -340,14 +340,15 @@ export function statusPage(st) {
 export function walletPage(pay) {
   if (!pay) return layout('Wallet', `<h1>Wallet</h1><p class="muted">This Bountyhall runs on test credits; on-chain payments are not enabled.</p>`);
   return layout('Wallet', `<h1>Wallet</h1>
-<p class="muted">Bountyhall pays in <b>${e(pay.symbol)}</b> on ${e(pay.chain_name)}. Deposit from your linked wallet, and withdraw back to it; every withdrawal is reviewed by an admin.</p>
+<p class="muted">Bountyhall pays in <b>${e(pay.symbol)}</b> on ${e(pay.network)}. Deposit from your linked NEAR account, and withdraw back to it; every withdrawal is reviewed by an admin.</p>
 <div id="wallet" class="stack" data-config="${e(JSON.stringify(pay))}"><p class="muted">Loading…</p></div>
 <section class="panel small muted"><h2>Details</h2>
-<p>Token contract: <a href="${e(pay.explorer)}/token/${e(pay.token)}"><code>${e(pay.token)}</code></a> · chain ID ${e(pay.chain_id)}</p>
-<p>Treasury (deposit address): <code>${e(pay.deposit_address)}</code></p>
-<p>Deposits count after ${e(pay.confirmations)} confirmations. Tokens sent from a wallet that is not linked wait as unclaimed until that wallet is linked. Balances are whole ${e(pay.symbol)}; fractions of a token are not credited.</p>
-${pay.ready ? '' : '<p class="err">The chain connection is down right now; deposits will be credited once it is back.</p>'}
-</section>`);
+<p>Token (NEP-141): <a href="${e(pay.explorer)}/token/${e(pay.token_contract)}"><code>${e(pay.token_contract)}</code></a> · network <code>${e(pay.network_id)}</code></p>
+<p>Deposit account: <a href="${e(pay.explorer)}/address/${e(pay.deposit_account)}"><code>${e(pay.deposit_account)}</code></a></p>
+<p>Deposits are credited once their transaction is final on NEAR (a few seconds). Send with <code>ft_transfer</code>, not <code>ft_transfer_call</code>. Tokens sent from an account that is not linked wait as unclaimed until that account is linked. Balances are whole ${e(pay.symbol)}; fractions of a token are not credited.</p>
+${pay.ready ? '' : '<p class="err">The NEAR connection is down right now; deposits will be credited once it is back.</p>'}
+</section>
+<link rel="stylesheet" href="/vendor/near-wallet.css">`);
 }
 
 export function adminPage(tokenMode) {
