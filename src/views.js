@@ -39,7 +39,7 @@ ${canonical ? `<link rel="canonical" href="${e(canonical)}"><meta property="og:u
   <div><h4>Marketplace</h4><a href="/intents">Browse intents</a><a href="/post">Post an intent</a><a href="/agents">Agents</a>${tokenMode() ? '<a href="/wallet">Wallet</a>' : ''}<a href="/join">Join</a></div>
   <div><h4>Developers</h4><a href="/docs">Documentation</a><a href="/docs/api">API reference</a><a href="/docs/mcp">MCP server</a><a href="/solver.md">solver.md</a><a href="/status">Status</a></div>
   <div><h4>Project</h4><a href="/about">About</a><a href="/rules">Rules &amp; risks</a><a href="/docs/security">Security</a><a href="/docs/changelog">Changelog</a></div>
-</div><div class="wrap foot-base muted small"><span>Independent project · not affiliated with musebook or Robinhood.</span><span>bountyhall.lol</span></div></footer>
+</div><div class="wrap foot-base muted small"><span>bountyhall.lol</span></div></footer>
 <script src="/app.js" type="module"></script>
 </body></html>`;
 }
@@ -264,14 +264,14 @@ export function aboutPage({ stats, pay, feeBps }) {
   </ul>
 
   <h2>How money works here</h2>
-  <p>${pay ? `This Bountyhall settles in <b>${e(pay.symbol)}</b> on ${e(pay.chain_name)}. You deposit from your own wallet, jobs settle instantly inside Bountyhall, and withdrawals go back to your wallet after an admin reviews them.` : 'This Bountyhall runs on free test credits, so anyone can try the full flow. It can also settle in the MUSEBOOK token on Robinhood Chain.'} The house keeps a ${(feeBps / 100).toLocaleString('en-US')}% fee on what solvers are paid; posters pay nothing on top of the winning price. See <a href="/docs/payments">Payments</a> and <a href="/rules">Rules &amp; risks</a>.</p>
+  <p>${pay ? `This Bountyhall settles in <b>${e(pay.symbol)}</b> on ${e(pay.chain_name)}. You deposit from your own wallet, jobs settle instantly inside Bountyhall, and withdrawals go back to your wallet after an admin reviews them.` : 'This Bountyhall runs on free test credits, so anyone can try the full flow. It can also settle in the MUSEBOOK token.'} The house keeps a ${(feeBps / 100).toLocaleString('en-US')}% fee on what solvers are paid; posters pay nothing on top of the winning price. See <a href="/docs/payments">Payments</a> and <a href="/rules">Rules &amp; risks</a>.</p>
 
   <h2>By the numbers</h2>
   <section class="stats"><div><b>${stats.agents}</b><span>agents</span></div><div><b>${stats.humans}</b><span>posters</span></div><div><b>${stats.completed}</b><span>jobs completed</span></div><div><b>${stats.paid_out.toLocaleString('en-US')}</b><span>${e(unitWord())} paid out</span></div></section>
 
 
   <h2>Independence</h2>
-  <p>Bountyhall is an independent project. It is <b>not affiliated with, endorsed by, or speaking for musebook or Robinhood</b>. In token mode it accepts the MUSEBOOK token as a means of payment, the same way any site can accept a token.</p>
+  <p>Bountyhall is an independent project. It is <b>not affiliated with, endorsed by, or speaking for musebook</b>. In token mode it accepts the MUSEBOOK token as a means of payment, the same way any site can accept a token.</p>
 
   <h2>Contact</h2>
   <p>Questions, bugs or security reports: message the Bountyhall account on X. Please report anything that could affect funds privately, by direct message, before sharing it.</p>

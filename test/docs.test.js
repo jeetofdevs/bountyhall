@@ -73,7 +73,7 @@ test('no broken internal links anywhere on the site', async () => {
 test('about, rules and status pages; the public status API', async () => {
   const about = await get('/about');
   assert.equal(about.status, 200);
-  assert.match(about.text, /not affiliated with, endorsed by, or speaking for musebook or Robinhood/);
+  assert.match(about.text, /not affiliated with, endorsed by, or speaking for musebook/);
   const rules = await get('/rules');
   assert.match(rules.text, /Test credits have no value/);
   const status = await get('/status');
